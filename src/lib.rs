@@ -171,6 +171,7 @@ enum Command {
     Reset,
     PingThread(ThreadId),
     CtrlC,
+    NonPacketInterrupt,
     UnknownVCommand,
     /// Set the current thread for future commands, such as `ReadRegister`.
     SetCurrentThread(ThreadId),
@@ -901,6 +902,9 @@ fn invoke_command<H, W>(command: Command,
         // Empty means "not implemented".
         Command::CtrlC => Response::Empty,
 
+        // The special 0x3 interrupt should not send a reply.
+        Command::NonPacketInterrupt => { return Ok(no_ack_mode); },
+
         // Unknown v commands are required to give an empty
         // response.
         Command::UnknownVCommand => Response::Empty,
@@ -963,8 +967,12 @@ pub fn process_packets_from<R, W, H>(reader: R,
                             },
                             // Ignore these.
                             Packet::Ack | Packet::Nack => {},
-                            // FIXME.
-                            Packet::Interrupt => {},
+                            Packet::Interrupt => {
+                                match thread_sender.send(Command::NonPacketInterrupt) {
+                                    Ok(_) => {},
+                                    Err(_) => { done = true; },
+                                };
+                            },
                         };
                         len
                     } else {
@@ -983,10 +991,11 @@ pub fn process_packets_from<R, W, H>(reader: R,
         loop {
             match receiver.recv() {
                 Ok(command) => {
-                    if ack_mode && !writer.write_all(&b"+"[..]).is_ok() {
-                        //TODO: propagate errors to caller?
-                        return;
-                    }
+                    if command != Command::NonPacketInterrupt &&
+                        ack_mode && !writer.write_all(&b"+"[..]).is_ok() {
+                            //TODO: propagate errors to caller?
+                            return;
+                        }
                     let no_ack_mode = invoke_command(command, &handler, &mut writer).unwrap_or(false);
                     if no_ack_mode {
                         ack_mode = false;
