@@ -1,3 +1,4 @@
+extern crate crossbeam;
 #[macro_use]
 extern crate nom;
 extern crate strum;
@@ -10,6 +11,7 @@ use std::borrow::Cow;
 use std::convert::From;
 use std::io::{self,BufRead,BufReader,Read,Write};
 use std::str::{self, FromStr};
+use std::sync::mpsc::channel;
 
 const MAX_PACKET_SIZE: usize = 65 * 1024;
 
@@ -63,25 +65,25 @@ enum GDBFeature {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum Known<'a> {
+enum Known {
     Yes(GDBFeature),
-    No(&'a str),
+    No(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct GDBFeatureSupported<'a>(Known<'a>, FeatureSupported<'a>);
+struct GDBFeatureSupported(Known, FeatureSupported);
 
 #[derive(Clone, Debug, PartialEq)]
-enum FeatureSupported<'a> {
+enum FeatureSupported {
     Yes,
     No,
     #[allow(unused)]
     Maybe,
-    Value(&'a str),
+    Value(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum Query<'a> {
+enum Query {
     /// Return the attached state of the indicated process.
     // FIXME the PID only needs to be optional in the
     // non-multi-process case, which we aren't supporting; but we
@@ -97,7 +99,7 @@ enum Query<'a> {
     // CRC { addr: u64, length: u64 },
     /// Tell the remote stub about features supported by gdb, and query the stub for features
     /// it supports.
-    SupportedFeatures(Vec<GDBFeatureSupported<'a>>),
+    SupportedFeatures(Vec<GDBFeatureSupported>),
     /// Disable acknowledgments.
     StartNoAckMode,
     /// Invoke a command on the server.  The server defines commands
@@ -143,7 +145,7 @@ pub struct ThreadId {
 /// GDB remote protocol commands, as defined in (the GDB documentation)[1]
 /// [1]: https://sourceware.org/gdb/onlinedocs/gdb/Packets.html#Packets
 #[derive(Clone, Debug, PartialEq)]
-enum Command<'a> {
+enum Command {
     /// Detach from a process or from all processes.
     Detach(Option<u64>),
     /// Enable extended mode.
@@ -165,23 +167,24 @@ enum Command<'a> {
     ReadMemory(u64, u64),
     // Write specified region of memory.
     WriteMemory(u64, u64, Vec<u8>),
-    Query(Query<'a>),
+    Query(Query),
     Reset,
     PingThread(ThreadId),
     CtrlC,
     UnknownVCommand,
     /// Set the current thread for future commands, such as `ReadRegister`.
     SetCurrentThread(ThreadId),
+    UnknownCommand,
 }
 
 named!(gdbfeature<Known>, map!(map_res!(is_not_s!(";="), str::from_utf8), |s| {
     match GDBFeature::from_str(s) {
         Ok(f) => Known::Yes(f),
-        Err(_) => Known::No(s),
+        Err(_) => Known::No(s.to_string()),
     }
 }));
 
-fn gdbfeaturesupported<'a>(i: &'a [u8]) -> IResult<&'a [u8], GDBFeatureSupported<'a>> {
+fn gdbfeaturesupported<'a>(i: &'a [u8]) -> IResult<&'a [u8], GDBFeatureSupported> {
     flat_map!(i, is_not!(";"), |f: &'a [u8]| {
         match f.split_last() {
             None => IResult::Incomplete(Needed::Size(2)),
@@ -194,7 +197,8 @@ fn gdbfeaturesupported<'a>(i: &'a [u8]) -> IResult<&'a [u8], GDBFeatureSupported
             Some((_, _)) => {
                 map!(f, separated_pair!(gdbfeature, tag!("="),
                                         map_res!(is_not!(";"), str::from_utf8)),
-                     |(feat, value)| GDBFeatureSupported(feat, FeatureSupported::Value(value)))
+                     |(feat, value)| GDBFeatureSupported(feat,
+                                                         FeatureSupported::Value(value.to_string())))
             }
         }
     })
@@ -210,14 +214,14 @@ named!(q_search_memory<&[u8], (u64, u64, Vec<u8>)>,
            data: hex_byte_sequence >>
            (address, length, data))));
 
-fn query<'a>(i: &'a [u8]) -> IResult<&'a [u8], Query<'a>> {
+fn query<'a>(i: &'a [u8]) -> IResult<&'a [u8], Query> {
     alt_complete!(i,
                   tag!("qC") => { |_| Query::CurrentThread }
                   | preceded!(tag!("qSupported"),
                               preceded!(tag!(":"),
                                         separated_list_complete!(tag!(";"),
                                                                  gdbfeaturesupported))) => {
-                      |features: Vec<GDBFeatureSupported<'a>>| Query::SupportedFeatures(features)
+                      |features: Vec<GDBFeatureSupported>| Query::SupportedFeatures(features)
                   }
                   | preceded!(tag!("qRcmd,"), hex_byte_sequence) => {
                       |bytes| Query::Invoke(bytes)
@@ -345,7 +349,7 @@ named!(parse_thread_id<&[u8], ThreadId>,
 named!(parse_ping_thread<&[u8], ThreadId>,
        preceded!(tag!("T"), parse_thread_id));
 
-fn v_command<'a>(i: &'a [u8]) -> IResult<&'a [u8], Command<'a>> {
+fn v_command<'a>(i: &'a [u8]) -> IResult<&'a [u8], Command> {
     alt_complete!(i,
                   tag!("vCtrlC") => { |_| Command::CtrlC }
                   | preceded!(tag!("vKill;"), hex_value) => {
@@ -368,7 +372,7 @@ named!(parse_d_packet<&[u8], Option<u64>>,
        }
        | tag!("D") => { |_| None }));
 
-fn command<'a>(i: &'a [u8]) -> IResult<&'a [u8], Command<'a>> {
+fn command<'a>(i: &'a [u8]) -> IResult<&'a [u8], Command> {
     alt!(i,
          tag!("!") => { |_|   Command::EnableExtendedMode }
          | tag!("?") => { |_| Command::TargetHaltReason }
@@ -786,7 +790,7 @@ fn write_response<W>(response: Response, writer: &mut W) -> io::Result<()>
     writer.finish()
 }
 
-fn handle_supported_features<'a, H>(_handler: &H, _features: &Vec<GDBFeatureSupported<'a>>) -> Response<'static>
+fn handle_supported_features<'a, H>(_handler: &H, _features: &Vec<GDBFeatureSupported>) -> Response<'static>
     where H: Handler,
 {
     let features = concat!("PacketSize=65536;QStartNoAckMode+;multiprocess+;QDisableRandomization+",
@@ -794,117 +798,114 @@ fn handle_supported_features<'a, H>(_handler: &H, _features: &Vec<GDBFeatureSupp
     Response::String(Cow::Borrowed(features))
 }
 
-/// Handle a single packet `data` with `handler` and write a response to `writer`.
-fn handle_packet<H, W>(data: &[u8],
-                       handler: &H,
-                       writer: &mut W) -> io::Result<bool>
+fn invoke_command<H, W>(command: Command,
+                        handler: &H,
+                        writer: &mut W) -> io::Result<bool>
     where H: Handler,
           W: Write,
 {
-    println!("Command: {}", str::from_utf8(data).unwrap());
     let mut no_ack_mode = false;
-    let response = if let Done(_, command) = command(data) {
-        match command {
-            // We unconditionally support extended mode.
-            Command::EnableExtendedMode => Response::Ok,
-            Command::TargetHaltReason => {
-                handler.halt_reason().into()
-            },
-            Command::ReadGeneralRegisters => {
-                handler.read_general_registers().into()
-            },
-            Command::WriteGeneralRegisters(bytes) => {
-                handler.write_general_registers(&bytes[..]).into()
-            },
-            Command::Kill(None) => {
-                // The k packet requires no response, so purposely
-                // ignore the result.
-                drop(handler.kill(None));
-                Response::Empty
-            },
-            Command::Kill(pid) => {
-                handler.kill(pid).into()
-            },
-            Command::Reset => Response::Empty,
-            Command::ReadRegister(regno) => {
-                handler.read_register(regno).into()
-            },
-            Command::WriteRegister(regno, bytes) => {
-                handler.write_register(regno, &bytes[..]).into()
-            },
-            Command::ReadMemory(address, length) => {
-                handler.read_memory(address, length).into()
-            },
-            Command::WriteMemory(address, length, bytes) => {
-                // The docs don't really say what to do if the given
-                // length disagrees with the number of bytes sent, so
-                // just error if they disagree.
-                if length as usize != bytes.len() {
-                    Response::Error(1)
-                } else {
-                    handler.write_memory(address, &bytes[..]).into()
-                }
-            },
-            Command::SetCurrentThread(thread_id) => {
-                handler.set_current_thread(thread_id).into()
-            },
-            Command::Detach(pid) => {
-                handler.detach(pid).into()
-            },
+    let response = match command {
+        // We unconditionally support extended mode.
+        Command::EnableExtendedMode => Response::Ok,
+        Command::TargetHaltReason => {
+            handler.halt_reason().into()
+        },
+        Command::ReadGeneralRegisters => {
+            handler.read_general_registers().into()
+        },
+        Command::WriteGeneralRegisters(bytes) => {
+            handler.write_general_registers(&bytes[..]).into()
+        },
+        Command::Kill(None) => {
+            // The k packet requires no response, so purposely
+            // ignore the result.
+            drop(handler.kill(None));
+            Response::Empty
+        },
+        Command::Kill(pid) => {
+            handler.kill(pid).into()
+        },
+        Command::Reset => Response::Empty,
+        Command::ReadRegister(regno) => {
+            handler.read_register(regno).into()
+        },
+        Command::WriteRegister(regno, bytes) => {
+            handler.write_register(regno, &bytes[..]).into()
+        },
+        Command::ReadMemory(address, length) => {
+            handler.read_memory(address, length).into()
+        },
+        Command::WriteMemory(address, length, bytes) => {
+            // The docs don't really say what to do if the given
+            // length disagrees with the number of bytes sent, so
+            // just error if they disagree.
+            if length as usize != bytes.len() {
+                Response::Error(1)
+            } else {
+                handler.write_memory(address, &bytes[..]).into()
+            }
+        },
+        Command::SetCurrentThread(thread_id) => {
+            handler.set_current_thread(thread_id).into()
+        },
+        Command::Detach(pid) => {
+            handler.detach(pid).into()
+        },
 
-            Command::Query(Query::Attached(pid)) => {
-                handler.attached(pid).into()
-            },
-            Command::Query(Query::CurrentThread) => {
-                handler.current_thread().into()
-            },
-            Command::Query(Query::Invoke(cmd)) => {
-                match handler.invoke(&cmd[..]) {
-                    Result::Ok(val) => {
-                        if val.len() == 0 {
-                            Response::Ok
-                        } else {
-                            Response::Output(val)
-                        }
-                    },
-                    Result::Err(Error::Error(val)) => Response::Error(val),
-                    Result::Err(Error::Unimplemented) => Response::Empty,
-                }
-            },
-            Command::Query(Query::SearchMemory { address, length, bytes }) => {
-                handler.search_memory(address, length, &bytes[..]).into()
-            },
-            Command::Query(Query::SupportedFeatures(features)) =>
-                handle_supported_features(handler, &features),
-            Command::Query(Query::StartNoAckMode) => {
-                no_ack_mode = true;
-                Response::Ok
+        Command::Query(Query::Attached(pid)) => {
+            handler.attached(pid).into()
+        },
+        Command::Query(Query::CurrentThread) => {
+            handler.current_thread().into()
+        },
+        Command::Query(Query::Invoke(cmd)) => {
+            match handler.invoke(&cmd[..]) {
+                Result::Ok(val) => {
+                    if val.len() == 0 {
+                        Response::Ok
+                    } else {
+                        Response::Output(val)
+                    }
+                },
+                Result::Err(Error::Error(val)) => Response::Error(val),
+                Result::Err(Error::Unimplemented) => Response::Empty,
             }
-            Command::Query(Query::AddressRandomization(randomize)) => {
-                handler.set_address_randomization(randomize).into()
-            }
-            Command::Query(Query::CatchSyscalls(calls)) => {
-                handler.catch_syscalls(calls).into()
-            }
-            Command::Query(Query::PassSignals(signals)) => {
-                handler.set_pass_signals(signals).into()
-            }
-            Command::Query(Query::ProgramSignals(signals)) => {
-                handler.set_program_signals(signals).into()
-            }
-            Command::Query(Query::ThreadInfo(thread_info)) => {
-                handler.thread_info(thread_info).into()
-            }
-
-            Command::PingThread(thread_id) => handler.ping_thread(thread_id).into(),
-            // Empty means "not implemented".
-            Command::CtrlC => Response::Empty,
-
-            // Unknown v commands are required to give an empty
-            // response.
-            Command::UnknownVCommand => Response::Empty,
+        },
+        Command::Query(Query::SearchMemory { address, length, bytes }) => {
+            handler.search_memory(address, length, &bytes[..]).into()
+        },
+        Command::Query(Query::SupportedFeatures(features)) =>
+            handle_supported_features(handler, &features),
+        Command::Query(Query::StartNoAckMode) => {
+            no_ack_mode = true;
+            Response::Ok
         }
-    } else { Response::Empty };
+        Command::Query(Query::AddressRandomization(randomize)) => {
+            handler.set_address_randomization(randomize).into()
+        }
+        Command::Query(Query::CatchSyscalls(calls)) => {
+            handler.catch_syscalls(calls).into()
+        }
+        Command::Query(Query::PassSignals(signals)) => {
+            handler.set_pass_signals(signals).into()
+        }
+        Command::Query(Query::ProgramSignals(signals)) => {
+            handler.set_program_signals(signals).into()
+        }
+        Command::Query(Query::ThreadInfo(thread_info)) => {
+            handler.thread_info(thread_info).into()
+        }
+
+        Command::PingThread(thread_id) => handler.ping_thread(thread_id).into(),
+        // Empty means "not implemented".
+        Command::CtrlC => Response::Empty,
+
+        // Unknown v commands are required to give an empty
+        // response.
+        Command::UnknownVCommand => Response::Empty,
+        Command::UnknownCommand => Response::Empty,
+    };
     write_response(response, writer)?;
     Ok(no_ack_mode)
 }
@@ -929,45 +930,72 @@ fn run_parser(buf: &[u8]) -> Option<(usize, Packet)> {
 pub fn process_packets_from<R, W, H>(reader: R,
                                      mut writer: W,
                                      handler: H)
-    where R: Read,
+    where R: Read + Send + Sync,
           W: Write,
           H: Handler
 {
-    let mut bufreader = BufReader::with_capacity(MAX_PACKET_SIZE, reader);
-    let mut done = false;
-    let mut ack_mode = true;
-    while !done {
-        let length = if let Ok(buf) = bufreader.fill_buf() {
-            if buf.len() == 0 {
-                done = true;
-            }
-            if let Some((len, packet)) = run_parser(buf) {
-                match packet {
-                    Packet::Data(ref data, ref _checksum) => {
-                        // Write an ACK
-                        if ack_mode && !writer.write_all(&b"+"[..]).is_ok() {
-                            //TODO: propagate errors to caller?
-                            return;
-                        }
-                        let no_ack_mode = handle_packet(&data, &handler, &mut writer).unwrap_or(false);
-                        if no_ack_mode {
-                            ack_mode = false;
-                        }
-                    },
-                    // Just ignore ACK/NACK/Interrupt
-                    _ => {},
+    let (sender, receiver) = channel();
+    let thread_sender = sender.clone();
+
+    crossbeam::scope(|scope| {
+        scope.spawn(move|| {
+            let mut bufreader = BufReader::with_capacity(MAX_PACKET_SIZE, reader);
+            let mut done = false;
+            while !done {
+                let length = if let Ok(buf) = bufreader.fill_buf() {
+                    if buf.len() == 0 {
+                        done = true;
+                    }
+                    if let Some((len, packet)) = run_parser(buf) {
+                        match packet {
+                            Packet::Data(ref data, ref _checksum) => {
+                                println!("Command: {}", str::from_utf8(data).unwrap());
+                                let parsed = command(data);
+                                let cmd = if let Done(_, command) = parsed {
+                                    command
+                                } else {
+                                    Command::UnknownCommand
+                                };
+                                match thread_sender.send(cmd) {
+                                    Ok(_) => {},
+                                    Err(_) => { done = true; },
+                                };
+                            },
+                            // Ignore these.
+                            Packet::Ack | Packet::Nack => {},
+                            // FIXME.
+                            Packet::Interrupt => {},
+                        };
+                        len
+                    } else {
+                        0
+                    }
+                } else {
+                    // Error reading
+                    done = true;
+                    0
                 };
-                len
-            } else {
-                0
+                bufreader.consume(length);
             }
-        } else {
-            // Error reading
-            done = true;
-            0
-        };
-        bufreader.consume(length);
-    }
+        });
+
+        let mut ack_mode = true;
+        loop {
+            match receiver.recv() {
+                Ok(command) => {
+                    if ack_mode && !writer.write_all(&b"+"[..]).is_ok() {
+                        //TODO: propagate errors to caller?
+                        return;
+                    }
+                    let no_ack_mode = invoke_command(command, &handler, &mut writer).unwrap_or(false);
+                    if no_ack_mode {
+                        ack_mode = false;
+                    }
+                },
+                _ => break,
+            };
+        }
+    });
 }
 
 #[test]
@@ -1018,7 +1046,7 @@ fn test_gdbfeaturesupported() {
                                                   FeatureSupported::Yes)));
     assert_eq!(gdbfeaturesupported(&b"xmlRegisters=i386"[..]),
                Done(&b""[..], GDBFeatureSupported(Known::Yes(GDBFeature::xmlRegisters),
-                                                  FeatureSupported::Value("i386"))));
+                                                  FeatureSupported::Value("i386".to_string()))));
     assert_eq!(gdbfeaturesupported(&b"qRelocInsn-"[..]),
                Done(&b""[..], GDBFeatureSupported(Known::Yes(GDBFeature::qRelocInsn),
                                                   FeatureSupported::No)));
@@ -1029,10 +1057,10 @@ fn test_gdbfeaturesupported() {
                Done(&b""[..], GDBFeatureSupported(Known::Yes(GDBFeature::vfork_events),
                                                   FeatureSupported::No)));
     assert_eq!(gdbfeaturesupported(&b"unknown-feature+"[..]),
-               Done(&b""[..], GDBFeatureSupported(Known::No("unknown-feature"),
+               Done(&b""[..], GDBFeatureSupported(Known::No("unknown-feature".to_string()),
                                                   FeatureSupported::Yes)));
     assert_eq!(gdbfeaturesupported(&b"unknown-feature-"[..]),
-               Done(&b""[..], GDBFeatureSupported(Known::No("unknown-feature"),
+               Done(&b""[..], GDBFeatureSupported(Known::No("unknown-feature".to_string()),
                                                   FeatureSupported::No)));
 }
 
@@ -1043,7 +1071,7 @@ fn test_gdbfeature() {
     assert_eq!(gdbfeature(&b"fork-events"[..]),
                Done(&b""[..], Known::Yes(GDBFeature::fork_events)));
     assert_eq!(gdbfeature(&b"some-unknown-feature"[..]),
-               Done(&b""[..], Known::No("some-unknown-feature")));
+               Done(&b""[..], Known::No("some-unknown-feature".to_string())));
 }
 
 #[test]
@@ -1067,7 +1095,7 @@ fn test_query() {
                                        FeatureSupported::Yes),
                    GDBFeatureSupported(Known::Yes(GDBFeature::no_resumed), FeatureSupported::Yes),
                    GDBFeatureSupported(Known::Yes(GDBFeature::xmlRegisters),
-                                       FeatureSupported::Value("i386")),
+                                       FeatureSupported::Value("i386".to_string())),
                    ])));
 }
 
