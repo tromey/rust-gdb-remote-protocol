@@ -794,10 +794,15 @@ fn handle_supported_features<'a, H>(_handler: &H, _features: &Vec<GDBFeatureSupp
     Response::String(Cow::Borrowed(features))
 }
 
+struct ClientState {
+    ack_mode: bool,
+}
+
 /// Handle a single packet `data` with `handler` and write a response to `writer`.
-fn handle_packet<H, W>(data: &[u8],
+fn handle_packet<H, W>(state: &mut ClientState,
+                       data: &[u8],
                        handler: &H,
-                       writer: &mut W) -> io::Result<bool>
+                       writer: &mut W) -> io::Result<()>
     where H: Handler,
           W: Write,
 {
@@ -906,7 +911,10 @@ fn handle_packet<H, W>(data: &[u8],
         }
     } else { Response::Empty };
     write_response(response, writer)?;
-    Ok(no_ack_mode)
+    if no_ack_mode {
+        state.ack_mode = false;
+    }
+    Ok(())
 }
 
 fn offset(from: &[u8], to: &[u8]) -> usize {
@@ -933,9 +941,10 @@ pub fn process_packets_from<R, W, H>(reader: R,
           W: Write,
           H: Handler
 {
+    let mut state = ClientState { ack_mode: true };
+
     let mut bufreader = BufReader::with_capacity(MAX_PACKET_SIZE, reader);
     let mut done = false;
-    let mut ack_mode = true;
     while !done {
         let length = if let Ok(buf) = bufreader.fill_buf() {
             if buf.len() == 0 {
@@ -945,14 +954,12 @@ pub fn process_packets_from<R, W, H>(reader: R,
                 match packet {
                     Packet::Data(ref data, ref _checksum) => {
                         // Write an ACK
-                        if ack_mode && !writer.write_all(&b"+"[..]).is_ok() {
+                        if state.ack_mode && !writer.write_all(&b"+"[..]).is_ok() {
                             //TODO: propagate errors to caller?
                             return;
                         }
-                        let no_ack_mode = handle_packet(&data, &handler, &mut writer).unwrap_or(false);
-                        if no_ack_mode {
-                            ack_mode = false;
-                        }
+                        // FIXME
+                        drop(handle_packet(&mut state, &data, &handler, &mut writer));
                     },
                     // Just ignore ACK/NACK/Interrupt
                     _ => {},
