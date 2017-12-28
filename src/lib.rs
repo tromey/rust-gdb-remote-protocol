@@ -83,9 +83,6 @@ enum FeatureSupported<'a> {
 #[derive(Clone, Debug, PartialEq)]
 enum Query<'a> {
     /// Return the attached state of the indicated process.
-    // FIXME the PID only needs to be optional in the
-    // non-multi-process case, which we aren't supporting; but we
-    // don't send multiprocess+ in the feature response yet.
     Attached(Option<u64>),
     /// Return the current thread ID.
     CurrentThread,
@@ -693,16 +690,18 @@ impl<'a, W> Write for PacketWriter<'a, W>
     }
 }
 
-fn write_thread_id<W>(writer: &mut W, thread_id: ThreadId) -> io::Result<()>
+fn write_thread_id<W>(multiprocess: bool, writer: &mut W, thread_id: ThreadId) -> io::Result<()>
     where W: Write
 {
-    write!(writer, "p")?;
-    match thread_id.pid {
-        Id::All => write!(writer, "-1"),
-        Id::Any => write!(writer, "0"),
-        Id::Id(num) => write!(writer, "{:x}", num),
-    }?;
-    write!(writer, ".")?;
+    if multiprocess {
+        write!(writer, "p")?;
+        match thread_id.pid {
+            Id::All => write!(writer, "-1"),
+            Id::Any => write!(writer, "0"),
+            Id::Id(num) => write!(writer, "{:x}", num),
+        }?;
+        write!(writer, ".")?;
+    }
     match thread_id.tid {
         Id::All => write!(writer, "-1"),
         Id::Any => write!(writer, "0"),
@@ -710,7 +709,7 @@ fn write_thread_id<W>(writer: &mut W, thread_id: ThreadId) -> io::Result<()>
     }
 }
 
-fn write_response<W>(response: Response, writer: &mut W) -> io::Result<()>
+fn write_response<W>(state: &ClientState, response: Response, writer: &mut W) -> io::Result<()>
     where W: Write,
 {
     write!(writer, "$")?;
@@ -745,7 +744,7 @@ fn write_response<W>(response: Response, writer: &mut W) -> io::Result<()>
                 None => write!(writer, "OK")?,
                 Some(thread_id) => {
                     write!(writer, "QC")?;
-                    write_thread_id(&mut writer, thread_id)?;
+                    write_thread_id(state.multiprocess, &mut writer, thread_id)?;
                 }
             };
         }
@@ -776,7 +775,7 @@ fn write_response<W>(response: Response, writer: &mut W) -> io::Result<()>
                 },
                 StopReason::ThreadExited(thread_id, status) => {
                     write!(writer, "w{:x};", status)?;
-                    write_thread_id(&mut writer, thread_id)?;
+                    write_thread_id(state.multiprocess, &mut writer, thread_id)?;
                 },
                 StopReason::NoMoreThreads => write!(writer, "N")?,
             }
@@ -786,20 +785,34 @@ fn write_response<W>(response: Response, writer: &mut W) -> io::Result<()>
     writer.finish()
 }
 
-fn handle_supported_features<'a, H>(_handler: &H, _features: &Vec<GDBFeatureSupported<'a>>) -> Response<'static>
+fn handle_supported_features<'a, H>(state: &mut ClientState, _handler: &H,
+                                    features: &Vec<GDBFeatureSupported<'a>>) -> Response<'static>
     where H: Handler,
 {
+    for feature in features {
+        if feature.1 != FeatureSupported::Yes {
+            continue;
+        }
+
+        if feature.0 == Known::Yes(GDBFeature::multiprocess) {
+            state.multiprocess = true;
+        }
+    }
+
     let features = concat!("PacketSize=65536;QStartNoAckMode+;multiprocess+;QDisableRandomization+",
                            ";QCatchSyscalls+;QPassSignals+;QProgramSignals+");
     Response::String(Cow::Borrowed(features))
 }
 
 struct ClientState {
+    // True if packets must be acked.
     ack_mode: bool,
+    // True if the multiprocess extensions are enabled.
+    multiprocess: bool,
 }
 
 /// Handle a single packet `data` with `handler` and write a response to `writer`.
-fn handle_packet<H, W>(state: &mut ClientState,
+fn handle_packet<H, W>(mut state: &mut ClientState,
                        data: &[u8],
                        handler: &H,
                        writer: &mut W) -> io::Result<()>
@@ -880,7 +893,7 @@ fn handle_packet<H, W>(state: &mut ClientState,
                 handler.search_memory(address, length, &bytes[..]).into()
             },
             Command::Query(Query::SupportedFeatures(features)) =>
-                handle_supported_features(handler, &features),
+                handle_supported_features(&mut state, handler, &features),
             Command::Query(Query::StartNoAckMode) => {
                 no_ack_mode = true;
                 Response::Ok
@@ -910,7 +923,7 @@ fn handle_packet<H, W>(state: &mut ClientState,
             Command::UnknownVCommand => Response::Empty,
         }
     } else { Response::Empty };
-    write_response(response, writer)?;
+    write_response(state, response, writer)?;
     if no_ack_mode {
         state.ack_mode = false;
     }
@@ -941,7 +954,7 @@ pub fn process_packets_from<R, W, H>(reader: R,
           W: Write,
           H: Handler
 {
-    let mut state = ClientState { ack_mode: true };
+    let mut state = ClientState { ack_mode: true, multiprocess: false };
 
     let mut bufreader = BufReader::with_capacity(MAX_PACKET_SIZE, reader);
     let mut done = false;
@@ -958,8 +971,10 @@ pub fn process_packets_from<R, W, H>(reader: R,
                             //TODO: propagate errors to caller?
                             return;
                         }
-                        // FIXME
-                        drop(handle_packet(&mut state, &data, &handler, &mut writer));
+                        match handle_packet(&mut state, &data, &handler, &mut writer) {
+                            Ok(()) => {},
+                            Err(_) => { done = true; }
+                        }
                     },
                     // Just ignore ACK/NACK/Interrupt
                     _ => {},
@@ -1211,8 +1226,9 @@ fn test_parse_write_general_registers() {
 #[test]
 fn test_write_response() {
     fn write_one(input: Response) -> io::Result<String> {
+        let mut state = ClientState { ack_mode: true, multiprocess: true };
         let mut result = Vec::new();
-        write_response(input, &mut result)?;
+        write_response(&mut state, input, &mut result)?;
         Ok(String::from_utf8(result).unwrap())
     }
 
