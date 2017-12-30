@@ -799,13 +799,18 @@ fn handle_supported_features<'a, H>(_handler: &H, _features: &Vec<GDBFeatureSupp
     Response::String(Cow::Borrowed(features))
 }
 
-fn invoke_command<H, W>(command: Command,
+// State of the server.
+struct State {
+    ack_mode: bool,
+}
+
+fn invoke_command<H, W>(state: &mut State,
+                        command: Command,
                         handler: &H,
-                        writer: &mut W) -> io::Result<bool>
+                        writer: &mut W) -> io::Result<()>
     where H: Handler,
           W: Write,
 {
-    let mut no_ack_mode = false;
     let response = match command {
         // We unconditionally support extended mode.
         Command::EnableExtendedMode => Response::Ok,
@@ -879,7 +884,7 @@ fn invoke_command<H, W>(command: Command,
         Command::Query(Query::SupportedFeatures(features)) =>
             handle_supported_features(handler, &features),
         Command::Query(Query::StartNoAckMode) => {
-            no_ack_mode = true;
+            state.ack_mode = false;
             Response::Ok
         }
         Command::Query(Query::AddressRandomization(randomize)) => {
@@ -903,7 +908,7 @@ fn invoke_command<H, W>(command: Command,
         Command::CtrlC => Response::Empty,
 
         // The special 0x3 interrupt should not send a reply.
-        Command::NonPacketInterrupt => { return Ok(no_ack_mode); },
+        Command::NonPacketInterrupt => { return Ok(()); },
 
         // Unknown v commands are required to give an empty
         // response.
@@ -911,7 +916,7 @@ fn invoke_command<H, W>(command: Command,
         Command::UnknownCommand => Response::Empty,
     };
     write_response(response, writer)?;
-    Ok(no_ack_mode)
+    Ok(())
 }
 
 fn offset(from: &[u8], to: &[u8]) -> usize {
@@ -987,19 +992,18 @@ pub fn process_packets_from<R, W, H>(reader: R,
             }
         });
 
-        let mut ack_mode = true;
+        let mut state = State {
+            ack_mode: true,
+        };
         loop {
             match receiver.recv() {
                 Ok(command) => {
                     if command != Command::NonPacketInterrupt &&
-                        ack_mode && !writer.write_all(&b"+"[..]).is_ok() {
+                        state.ack_mode && !writer.write_all(&b"+"[..]).is_ok() {
                             //TODO: propagate errors to caller?
                             return;
                         }
-                    let no_ack_mode = invoke_command(command, &handler, &mut writer).unwrap_or(false);
-                    if no_ack_mode {
-                        ack_mode = false;
-                    }
+                    let _ = invoke_command(&mut state, command, &handler, &mut writer);
                 },
                 _ => break,
             };
