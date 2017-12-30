@@ -1,6 +1,6 @@
 extern crate gdb_remote_protocol;
 
-use gdb_remote_protocol::{Error,Handler,ProcessType,process_packets_from,StopReason};
+use gdb_remote_protocol::{Error,Handler,Id,ProcessType,process_packets_from,StopReason,ThreadId};
 use std::net::TcpListener;
 
 struct NoopHandler;
@@ -12,6 +12,10 @@ impl Handler for NoopHandler {
 
     fn halt_reason(&self) -> Result<StopReason, Error> {
         Ok(StopReason::Exited(23, 0))
+    }
+
+    fn list_threads(&self) -> Vec<ThreadId> {
+        vec!(ThreadId { pid: Id::Id(23), tid: Id::Id(0) })
     }
 }
 

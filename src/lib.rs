@@ -114,6 +114,11 @@ enum Query {
     ThreadInfo(ThreadId),
     /// Enter or exit non-stop mode.
     NonStop(bool),
+    /// Thread listing happens in a sequence: first
+    /// ListThreadsInitial, then a series of ListMoreThreads until the
+    /// server indicates the end of the list.
+    ListThreadsInitial,
+    ListMoreThreads,
 }
 
 /// Part of a process id.
@@ -254,6 +259,8 @@ fn query<'a>(i: &'a [u8]) -> IResult<&'a [u8], Query> {
                   }
                   | tag!("QNonStop:0") => { |_| Query::NonStop(false) }
                   | tag!("QNonStop:1") => { |_| Query::NonStop(true) }
+                  | tag!("qfThreadInfo") => { |_| Query::ListThreadsInitial }
+                  | tag!("qsThreadInfo") => { |_| Query::ListMoreThreads }
                   )
 }
 
@@ -576,6 +583,12 @@ pub trait Handler {
     fn thread_info(&self, _thread: ThreadId) -> Result<String, Error> {
         Err(Error::Unimplemented)
     }
+
+    /// Return all the active threads.  Note that the first thread
+    /// mentioned is special: gdb will try to stop it during the
+    /// initial connection, so it must be a thread that makes sense to
+    /// stop.
+    fn list_threads(&self) -> Vec<ThreadId>;
 }
 
 fn compute_checksum_incremental(bytes: &[u8], init: u8) -> u8 {
@@ -593,6 +606,7 @@ enum Response<'a> {
     ProcessType(ProcessType),
     Stopped(StopReason),
     SearchResult(Option<u64>),
+    ThreadList(Vec<ThreadId>),
 }
 
 impl<'a, T> From<Result<T, Error>> for Response<'a>
@@ -789,6 +803,20 @@ fn write_response<W>(state: &State, response: Response, writer: &mut W) -> io::R
                 StopReason::NoMoreThreads => write!(writer, "N")?,
             }
         }
+        Response::ThreadList(threads) => {
+            // FIXME: in theory we are limited by the packet size.
+            if threads.len() == 0 {
+                write!(writer, "l")?;
+            } else {
+                write!(writer, "m")?;
+                for i in 0..threads.len() {
+                    if i > 0 {
+                        write!(writer, ",")?;
+                    }
+                    write_thread_id(state.multiprocess, &mut writer, threads[i])?;
+                }
+            }
+        }
     }
 
     writer.finish()
@@ -925,6 +953,12 @@ fn invoke_command<H, W>(state: &mut State,
         Command::Query(Query::ThreadInfo(thread_info)) => {
             handler.thread_info(thread_info).into()
         }
+
+        Command::Query(Query::ListThreadsInitial) => {
+            // FIXME: in theory we are limited by the packet size.
+            Response::ThreadList(handler.list_threads())
+        }
+        Command::Query(Query::ListMoreThreads) => Response::ThreadList(vec!()),
 
         Command::PingThread(thread_id) => handler.ping_thread(thread_id).into(),
         // Empty means "not implemented".
@@ -1286,4 +1320,12 @@ fn test_write_response() {
         tid: Id::Id(1)
     }))).unwrap(),
                "$QCpff.1#2f");
+}
+
+#[test]
+fn test_parse_querythread() {
+    assert_eq!(query(&b"qfThreadInfo"[..]),
+               Done(&b""[..], Query::ListThreadsInitial));
+    assert_eq!(query(&b"qsThreadInfo"[..]),
+               Done(&b""[..], Query::ListMoreThreads));
 }
