@@ -85,9 +85,6 @@ enum FeatureSupported {
 #[derive(Clone, Debug, PartialEq)]
 enum Query {
     /// Return the attached state of the indicated process.
-    // FIXME the PID only needs to be optional in the
-    // non-multi-process case, which we aren't supporting; but we
-    // don't send multiprocess+ in the feature response yet.
     Attached(Option<u64>),
     /// Return the current thread ID.
     CurrentThread,
@@ -698,16 +695,18 @@ impl<'a, W> Write for PacketWriter<'a, W>
     }
 }
 
-fn write_thread_id<W>(writer: &mut W, thread_id: ThreadId) -> io::Result<()>
+fn write_thread_id<W>(multiprocess: bool, writer: &mut W, thread_id: ThreadId) -> io::Result<()>
     where W: Write
 {
-    write!(writer, "p")?;
-    match thread_id.pid {
-        Id::All => write!(writer, "-1"),
-        Id::Any => write!(writer, "0"),
-        Id::Id(num) => write!(writer, "{:x}", num),
-    }?;
-    write!(writer, ".")?;
+    if multiprocess {
+        write!(writer, "p")?;
+        match thread_id.pid {
+            Id::All => write!(writer, "-1"),
+            Id::Any => write!(writer, "0"),
+            Id::Id(num) => write!(writer, "{:x}", num),
+        }?;
+        write!(writer, ".")?;
+    }
     match thread_id.tid {
         Id::All => write!(writer, "-1"),
         Id::Any => write!(writer, "0"),
@@ -715,7 +714,7 @@ fn write_thread_id<W>(writer: &mut W, thread_id: ThreadId) -> io::Result<()>
     }
 }
 
-fn write_response<W>(response: Response, writer: &mut W) -> io::Result<()>
+fn write_response<W>(state: &State, response: Response, writer: &mut W) -> io::Result<()>
     where W: Write,
 {
     write!(writer, "$")?;
@@ -750,7 +749,7 @@ fn write_response<W>(response: Response, writer: &mut W) -> io::Result<()>
                 None => write!(writer, "OK")?,
                 Some(thread_id) => {
                     write!(writer, "QC")?;
-                    write_thread_id(&mut writer, thread_id)?;
+                    write_thread_id(state.multiprocess, &mut writer, thread_id)?;
                 }
             };
         }
@@ -781,7 +780,7 @@ fn write_response<W>(response: Response, writer: &mut W) -> io::Result<()>
                 },
                 StopReason::ThreadExited(thread_id, status) => {
                     write!(writer, "w{:x};", status)?;
-                    write_thread_id(&mut writer, thread_id)?;
+                    write_thread_id(state.multiprocess, &mut writer, thread_id)?;
                 },
                 StopReason::NoMoreThreads => write!(writer, "N")?,
             }
@@ -791,9 +790,20 @@ fn write_response<W>(response: Response, writer: &mut W) -> io::Result<()>
     writer.finish()
 }
 
-fn handle_supported_features<'a, H>(_handler: &H, _features: &Vec<GDBFeatureSupported>) -> Response<'static>
+fn handle_supported_features<'a, H>(state: &mut State, _handler: &H,
+                                    features: &Vec<GDBFeatureSupported>) -> Response<'static>
     where H: Handler,
 {
+    for feature in features {
+        if feature.1 != FeatureSupported::Yes {
+            continue;
+        }
+
+        if feature.0 == Known::Yes(GDBFeature::multiprocess) {
+            state.multiprocess = true;
+        }
+    }
+
     let features = concat!("PacketSize=65536;QStartNoAckMode+;multiprocess+;QDisableRandomization+",
                            ";QCatchSyscalls+;QPassSignals+;QProgramSignals+");
     Response::String(Cow::Borrowed(features))
@@ -801,7 +811,10 @@ fn handle_supported_features<'a, H>(_handler: &H, _features: &Vec<GDBFeatureSupp
 
 // State of the server.
 struct State {
+    // True if packets must be acked.
     ack_mode: bool,
+    // True if the multiprocess extensions are enabled.
+    multiprocess: bool,
 }
 
 fn invoke_command<H, W>(state: &mut State,
@@ -882,7 +895,7 @@ fn invoke_command<H, W>(state: &mut State,
             handler.search_memory(address, length, &bytes[..]).into()
         },
         Command::Query(Query::SupportedFeatures(features)) =>
-            handle_supported_features(handler, &features),
+            handle_supported_features(state, handler, &features),
         Command::Query(Query::StartNoAckMode) => {
             state.ack_mode = false;
             Response::Ok
@@ -915,7 +928,7 @@ fn invoke_command<H, W>(state: &mut State,
         Command::UnknownVCommand => Response::Empty,
         Command::UnknownCommand => Response::Empty,
     };
-    write_response(response, writer)?;
+    write_response(state, response, writer)?;
     Ok(())
 }
 
@@ -994,6 +1007,7 @@ pub fn process_packets_from<R, W, H>(reader: R,
 
         let mut state = State {
             ack_mode: true,
+            multiprocess: false,
         };
         loop {
             match receiver.recv() {
@@ -1003,6 +1017,7 @@ pub fn process_packets_from<R, W, H>(reader: R,
                             //TODO: propagate errors to caller?
                             return;
                         }
+                    // FIXME error handling here as well.
                     let _ = invoke_command(&mut state, command, &handler, &mut writer);
                 },
                 _ => break,
@@ -1245,8 +1260,9 @@ fn test_parse_write_general_registers() {
 #[test]
 fn test_write_response() {
     fn write_one(input: Response) -> io::Result<String> {
+        let mut state = State { ack_mode: true, multiprocess: true };
         let mut result = Vec::new();
-        write_response(input, &mut result)?;
+        write_response(&mut state, input, &mut result)?;
         Ok(String::from_utf8(result).unwrap())
     }
 
