@@ -112,6 +112,8 @@ enum Query {
     ProgramSignals(Vec<u64>),
     /// Get a string description of a thread.
     ThreadInfo(ThreadId),
+    /// Enter or exit non-stop mode.
+    NonStop(bool),
 }
 
 /// Part of a process id.
@@ -250,6 +252,8 @@ fn query<'a>(i: &'a [u8]) -> IResult<&'a [u8], Query> {
                   | preceded!(tag!("qThreadExtraInfo,"), parse_thread_id) => {
                       |thread_id| Query::ThreadInfo(thread_id)
                   }
+                  | tag!("QNonStop:0") => { |_| Query::NonStop(false) }
+                  | tag!("QNonStop:1") => { |_| Query::NonStop(true) }
                   )
 }
 
@@ -805,7 +809,7 @@ fn handle_supported_features<'a, H>(state: &mut State, _handler: &H,
     }
 
     let features = concat!("PacketSize=65536;QStartNoAckMode+;multiprocess+;QDisableRandomization+",
-                           ";QCatchSyscalls+;QPassSignals+;QProgramSignals+");
+                           ";QCatchSyscalls+;QPassSignals+;QProgramSignals+;QNonStop+");
     Response::String(Cow::Borrowed(features))
 }
 
@@ -815,6 +819,8 @@ struct State {
     ack_mode: bool,
     // True if the multiprocess extensions are enabled.
     multiprocess: bool,
+    // True if non-stop mode is currently enabled.
+    non_stop: bool,
 }
 
 fn invoke_command<H, W>(state: &mut State,
@@ -891,6 +897,10 @@ fn invoke_command<H, W>(state: &mut State,
                 Result::Err(Error::Unimplemented) => Response::Empty,
             }
         },
+        Command::Query(Query::NonStop(value)) => {
+            state.non_stop = value;
+            Response::Ok
+        }
         Command::Query(Query::SearchMemory { address, length, bytes }) => {
             handler.search_memory(address, length, &bytes[..]).into()
         },
@@ -1008,6 +1018,7 @@ pub fn process_packets_from<R, W, H>(reader: R,
         let mut state = State {
             ack_mode: true,
             multiprocess: false,
+            non_stop: false,
         };
         loop {
             match receiver.recv() {
@@ -1260,7 +1271,7 @@ fn test_parse_write_general_registers() {
 #[test]
 fn test_write_response() {
     fn write_one(input: Response) -> io::Result<String> {
-        let mut state = State { ack_mode: true, multiprocess: true };
+        let mut state = State { ack_mode: true, multiprocess: true, non_stop: false, };
         let mut result = Vec::new();
         write_response(&mut state, input, &mut result)?;
         Ok(String::from_utf8(result).unwrap())
