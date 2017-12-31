@@ -24,7 +24,6 @@ extern crate strum_macros;
 
 use nom::IResult::*;
 use nom::{IResult, Needed};
-use std::borrow::Cow;
 use std::convert::From;
 use std::io::{self,BufRead,BufReader,Read,Write};
 use std::str::{self, FromStr};
@@ -636,11 +635,11 @@ fn compute_checksum_incremental(bytes: &[u8], init: u8) -> u8 {
     bytes.iter().fold(init, |sum, &b| sum.wrapping_add(b))
 }
 
-enum Response<'a> {
+enum Response {
     Empty,
     Ok,
     Error(u8),
-    String(Cow<'a, str>),
+    String(String),
     Output(String),
     Bytes(Vec<u8>),
     CurrentThread(Option<ThreadId>),
@@ -650,8 +649,8 @@ enum Response<'a> {
     ThreadList(Vec<ThreadId>),
 }
 
-impl<'a, T> From<Result<T, Error>> for Response<'a>
-    where Response<'a>: From<T>
+impl<T> From<Result<T, Error>> for Response
+    where Response: From<T>
 {
     fn from(result: Result<T, Error>) -> Self {
         match result {
@@ -662,21 +661,21 @@ impl<'a, T> From<Result<T, Error>> for Response<'a>
     }
 }
 
-impl<'a> From<()> for Response<'a>
+impl From<()> for Response
 {
     fn from(_: ()) -> Self {
         Response::Ok
     }
 }
 
-impl<'a> From<Vec<u8>> for Response<'a>
+impl From<Vec<u8>> for Response
 {
     fn from(response: Vec<u8>) -> Self {
         Response::Bytes(response)
     }
 }
 
-impl<'a> From<Option<ThreadId>> for Response<'a>
+impl From<Option<ThreadId>> for Response
 {
     fn from(response: Option<ThreadId>) -> Self {
         Response::CurrentThread(response)
@@ -685,31 +684,31 @@ impl<'a> From<Option<ThreadId>> for Response<'a>
 
 // This seems a bit specific -- what if some other handler method
 // wants to return an Option<u64>?
-impl<'a> From<Option<u64>> for Response<'a>
+impl From<Option<u64>> for Response
 {
     fn from(response: Option<u64>) -> Self {
         Response::SearchResult(response)
     }
 }
 
-impl<'a> From<ProcessType> for Response<'a>
+impl From<ProcessType> for Response
 {
     fn from(process_type: ProcessType) -> Self {
         Response::ProcessType(process_type)
     }
 }
 
-impl<'a> From<StopReason> for Response<'a>
+impl From<StopReason> for Response
 {
     fn from(reason: StopReason) -> Self {
         Response::Stopped(reason)
     }
 }
 
-impl<'a> From<String> for Response<'a>
+impl From<String> for Response
 {
     fn from(reason: String) -> Self {
-        Response::String(Cow::Owned(reason) as Cow<str>)
+        Response::String(reason)
     }
 }
 
@@ -864,7 +863,7 @@ fn write_response<W>(state: &State, response: Response, writer: &mut W) -> io::R
 }
 
 fn handle_supported_features<'a, H>(state: &mut State, handler: &H,
-                                    features: &Vec<GDBFeatureSupported>) -> Response<'static>
+                                    features: &Vec<GDBFeatureSupported>) -> Response
     where H: Handler,
 {
     for feature in features {
@@ -886,7 +885,7 @@ fn handle_supported_features<'a, H>(state: &mut State, handler: &H,
                             "QProgramSignals+".to_string());
     let mut new_features = handler.query_supported_features();
     features.append(&mut new_features);
-    Response::String(Cow::Owned(features.join(";")) as Cow<str>)
+    Response::String(features.join(";"))
 }
 
 // State of the server.
